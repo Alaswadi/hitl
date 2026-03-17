@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    container_name: mosaaedak-hitl
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/usr/src/app/data
+    env_file:
+      - .env
