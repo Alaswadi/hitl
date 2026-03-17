@@ -6,7 +6,7 @@ services:
     container_name: mosaaedak-hitl
     restart: unless-stopped
     ports:
-      - "9000:9000"
+      - "9999:9999"
     volumes:
       - ./data:/usr/src/app/data
     env_file:
