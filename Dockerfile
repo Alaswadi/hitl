@@ -20,7 +20,7 @@ COPY . .
 RUN mkdir -p data
 
 # Expose the application port
-EXPOSE 9000
+EXPOSE 9999
 
 # Start the application
 CMD ["npm", "start"]
