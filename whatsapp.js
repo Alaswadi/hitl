@@ -68,13 +68,36 @@ async function processWhatsappWebhook(body) {
     }
   }
 
+  // Keyword check for Human Takeover (Option 1)
+  const humanKeywords = ["موظف", "بشري", "خدمة العملاء", "مساعدة", "التحدث مع شخص", "اكلم حد"];
+  const wantsHuman = humanKeywords.some(kw => incomingText.includes(kw));
+
+  if (wantsHuman) {
+    console.log(`Customer ${customerId} requested human via keyword. Pausing bot.`);
+    updateStatus(customerId, 'human_handling');
+    await sendWhatsappMessage(customerId, "تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.");
+    return;
+  }
+
   const chatHistory = session ? session.chat_history : [];
 
   try {
-    const whatsappPrompt = process.env.WHATSAPP_PROMPT || "You are a helpful customer service representative interacting over WhatsApp. Be polite, concise, and helpful.";
+    const whatsappPrompt = process.env.WHATSAPP_PROMPT || "أنت ممثل خدمة عملاء محترف عبر الواتساب. كن مهذباً ومختصراً. إذا طلب العميل صراحةً التحدث إلى موظف بشري أو كان غاضباً، يجب عليك أن تكتب [PAUSE_BOT] في ردك ليتم تحويله.";
 
     // 2. Generate AI Response
-    const aiReplyText = await generateAIResponse(whatsappPrompt, chatHistory, incomingText);
+    let aiReplyText = await generateAIResponse(whatsappPrompt, chatHistory, incomingText);
+
+    // AI-driven Takeover check (Option 2)
+    if (aiReplyText.includes("[PAUSE_BOT]")) {
+      console.log(`AI opted to pause bot for ${customerId}.`);
+      updateStatus(customerId, 'human_handling');
+      
+      // Clean up the text sent to the user
+      aiReplyText = aiReplyText.replace(/\[PAUSE_BOT\]/gi, '').trim();
+      if (!aiReplyText) {
+        aiReplyText = "تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.";
+      }
+    }
 
     // 3. Update Chat History
     const newHistory = [
