@@ -90,8 +90,22 @@ async function processWebhookEvent(body) {
     let session = getSession(customerId);
     
     if (session && session.status === 'human_handling') {
-      console.log(`Message from ${customerId} ignored because human_handling is active.`);
-      continue; // Return without AI generation
+      const hitlTimeout = parseInt(process.env.HITL_TIMEOUT_MINUTES || '30', 10);
+      // SQLite CURRENT_TIMESTAMP is in UTC format 'YYYY-MM-DD HH:MM:SS'
+      // By appending 'Z', JS Date correctly parses it as UTC time
+      const updatedAtStr = session.updated_at.replace(' ', 'T') + 'Z';
+      const updatedAt = new Date(updatedAtStr);
+      const now = new Date();
+      const diffMinutes = (now - updatedAt) / (1000 * 60);
+
+      if (diffMinutes > hitlTimeout) {
+        console.log(`Human handling timeout (${hitlTimeout}m) reached for ${customerId}. Reverting to bot_active.`);
+        updateStatus(customerId, 'bot_active');
+        session.status = 'bot_active';
+      } else {
+        console.log(`Message from ${customerId} ignored because human_handling is active. (${Math.round(hitlTimeout - diffMinutes)}m remaining)`);
+        continue; // Return without AI generation
+      }
     }
 
     // 2. We proceed to AI Generation if status is 'bot_active' or new user
