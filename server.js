@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { initDb } = require('./db');
 const { processWebhookEvent } = require('./facebook');
+const { processWhatsappWebhook } = require('./whatsapp');
 
 const app = express();
 const PORT = process.env.PORT || 9000;
@@ -51,6 +52,19 @@ app.post('/webhook', async (req, res) => {
   } else {
     res.sendStatus(404);
   }
+});
+
+// POST /whatsapp/webhook: Handle incoming WhatsApp messages from TextMeBot
+app.post('/whatsapp/webhook', async (req, res) => {
+  let body = req.body;
+  
+  // Return 200 OK immediately
+  res.status(200).send('EVENT_RECEIVED');
+  
+  // Process the event asynchronously
+  processWhatsappWebhook(body).catch(err => {
+    console.error('Unhandled WhatsApp webhook error:', err);
+  });
 });
 
 app.listen(PORT, '0.0.0.0', () => {

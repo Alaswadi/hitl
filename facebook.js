@@ -73,8 +73,8 @@ async function processWebhookEvent(body) {
     const isSentByPage = (senderId === pageId) || message.is_echo;
 
     if (isSentByPage) {
-      // It's a Human Admin replying. The customer is actually the recipientId here.
-      const customerId = (senderId === pageId) ? recipientId : recipientId; // For echos, recipient is the user.
+      // It's a Human Admin replying. For echo events, recipient is the customer.
+      const customerId = recipientId;
       console.log(`Human admin replied to ${customerId}. Pausing bot.`);
       updateStatus(customerId, 'human_handling');
       continue;
