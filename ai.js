@@ -5,34 +5,28 @@ const openai = new OpenAI({
   baseURL: 'https://openrouter.ai/api/v1',
 });
 
+const DEFAULT_MODEL = 'openai/gpt-4o-mini';
+
 /**
- * Generate AI response using OpenRouter
- * @param {string} systemPrompt - Dynamic system prompt fetched from Mosaaedak configs
- * @param {Array} chatHistory - Previous interaction objects [{ role: 'user'|'assistant', content: string }]
- * @param {string} userMessage - Latest user message
- * @returns {string} The AI generated text
+ * Generate AI response via OpenRouter.
+ * @param {string} systemPrompt
+ * @param {Array}  chatHistory  - [{ role, content }, ...]
+ * @param {string} userMessage
+ * @param {string} [model]      - OpenRouter model ID (falls back to DEFAULT_MODEL)
  */
-async function generateAIResponse(systemPrompt, chatHistory, userMessage) {
-  try {
-    // Formulate the conversation log payload
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...chatHistory,
-      { role: 'user', content: userMessage }
-    ];
+async function generateAIResponse(systemPrompt, chatHistory, userMessage, model) {
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...chatHistory,
+    { role: 'user', content: userMessage },
+  ];
 
-    const response = await openai.chat.completions.create({
-      model: 'openai/gpt-oss-120b',
-      messages: messages,
-    });
+  const response = await openai.chat.completions.create({
+    model: model || DEFAULT_MODEL,
+    messages,
+  });
 
-    return response.choices[0].message.content;
-  } catch (error) {
-    console.error('Error generating AI response via OpenRouter:', error.message);
-    throw error;
-  }
+  return response.choices[0].message.content;
 }
 
-module.exports = {
-  generateAIResponse
-};
+module.exports = { generateAIResponse };

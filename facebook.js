@@ -2,160 +2,159 @@ const axios = require('axios');
 const { getSession, updateStatus, saveChatHistory } = require('./db');
 const { generateAIResponse } = require('./ai');
 
+const MOSAAEDAK_API_URL = process.env.MOSAAEDAK_API_URL;
 const MOSAAEDAK_API_KEY = process.env.MOSAAEDAK_API_KEY;
+const COST_PER_MESSAGE = parseFloat(process.env.COST_PER_MESSAGE || '0.03');
 
 /**
- * Fetch bot configuration from Mosaaedak API
- * @param {string} pageId - The Facebook Page ID
+ * Fetch tenant config from Mosaaedak by Facebook Page ID.
+ * Returns { tenantId, facebookAccessToken, activePrompt, aiModel }
  */
 async function fetchBotConfig(pageId) {
-  try {
-    const url = `https://api.mosaaedak.com/api/integrations/facebook/config/${pageId}`;
-    const response = await axios.get(url, {
-      headers: {
-        'X-API-Key': MOSAAEDAK_API_KEY
-      }
-    });
-    return response.data; // expects { facebookAccessToken, facebookPrompt }
-  } catch (error) {
-    console.error('Error fetching bot config:', error.message);
-    throw error;
-  }
+  const url = `${MOSAAEDAK_API_URL}/api/integrations/facebook/config/${encodeURIComponent(pageId)}`;
+  const response = await axios.get(url, {
+    headers: { 'X-API-Key': MOSAAEDAK_API_KEY },
+    timeout: 5000,
+  });
+  return response.data;
 }
 
 /**
- * Send a message to Facebook Messenger using the Graph API
- * @param {string} pageId - The Page ID sending the message
- * @param {string} customerId - The recipient's user ID
- * @param {string} text - The AI generated text
- * @param {string} accessToken - The page's access token
+ * Send a message via the Facebook Graph API.
  */
 async function sendFacebookMessage(pageId, customerId, text, accessToken) {
-  try {
-    // API v24.0 requires POST matching graph.facebook.com endpoint
-    const url = `https://graph.facebook.com/v24.0/${pageId}/messages?access_token=${accessToken}`;
-    const payload = {
+  const url = `https://graph.facebook.com/v24.0/${pageId}/messages?access_token=${accessToken}`;
+  await axios.post(
+    url,
+    {
       recipient: { id: customerId },
       messaging_type: 'RESPONSE',
-      message: { text: text }
-    };
+      message: { text },
+    },
+    { timeout: 10000 }
+  );
+}
 
-    await axios.post(url, payload);
-    console.log(`Successfully sent message to ${customerId}`);
-  } catch (error) {
-    console.error('Error sending message to Facebook:', error.response ? error.response.data : error.message);
+/**
+ * Log message usage back to Mosaaedak for billing.
+ */
+async function logUsage(tenantId, direction, content, fromPhone) {
+  try {
+    await axios.post(
+      `${MOSAAEDAK_API_URL}/api/integrations/n8n/usage`,
+      {
+        tenantId,
+        direction,
+        content,
+        channel: 'MESSENGER',
+        from: fromPhone,
+        cost: direction === 'OUTBOUND' ? COST_PER_MESSAGE : 0,
+        deduct: direction === 'OUTBOUND',
+      },
+      {
+        headers: { 'X-API-Key': MOSAAEDAK_API_KEY },
+        timeout: 5000,
+      }
+    );
+  } catch (err) {
+    console.error('[FB] Failed to log usage:', err.message);
   }
 }
 
 /**
- * Handle incoming webhooks
+ * Handle incoming Facebook webhook events.
  */
 async function processWebhookEvent(body) {
-  if (body.object !== 'page') {
-    return; // Ignore non-page webhooks
-  }
+  if (body.object !== 'page') return;
 
   for (const entry of body.entry) {
-    const pageId = entry.id; // The recipient.id / page ID
-    const webhookEvent = entry.messaging[0];
-    
-    if (!webhookEvent || !webhookEvent.message) {
-      continue; // Not a message event
-    }
+    const pageId = entry.id;
+    const webhookEvent = entry.messaging?.[0];
+
+    if (!webhookEvent?.message) continue;
 
     const senderId = webhookEvent.sender.id;
     const recipientId = webhookEvent.recipient.id;
     const message = webhookEvent.message;
 
-    // Is this a message sent BY the page (e.g. human admin reply via Inbox)?
-    // Usually, messages sent by the page come with an 'is_echo' flag.
-    // Or senderId strictly matches pageId.
-    const isSentByPage = (senderId === pageId) || message.is_echo;
-
+    // Admin reply via Page Inbox — pause bot
+    const isSentByPage = senderId === pageId || message.is_echo;
     if (isSentByPage) {
-      // It's a Human Admin replying. For echo events, recipient is the customer.
       const customerId = recipientId;
-      console.log(`Human admin replied to ${customerId}. Pausing bot.`);
-      updateStatus(customerId, 'human_handling');
+      // We don't know the tenantId here without a DB lookup, so use pageId as scope
+      const sessionKey = `fb:${pageId}:${customerId}`;
+      console.log(`[FB] Admin replied to ${customerId} — pausing bot.`);
+      updateStatus(sessionKey, 'human_handling');
       continue;
     }
 
-    // Otherwise, it's a message from a normal customer to the Page
     const customerId = senderId;
     const incomingText = message.text;
+    if (!incomingText || typeof incomingText !== 'string') continue;
 
-    if (!incomingText) continue; // Ignore attachments/stickers for now
+    // 1. Fetch tenant config
+    let config;
+    try {
+      config = await fetchBotConfig(pageId);
+    } catch (err) {
+      console.error(`[FB] Cannot find tenant for page ${pageId}:`, err.message);
+      continue;
+    }
 
-    // 1. Check DB State
-    let session = getSession(customerId);
-    
+    const { tenantId, facebookAccessToken, activePrompt, aiModel } = config;
+
+    if (!facebookAccessToken) {
+      console.error(`[FB] No access token for page ${pageId}`);
+      continue;
+    }
+
+    // 2. Session key scoped to tenant + customer
+    const sessionKey = `fb:${tenantId}:${customerId}`;
+    let session = getSession(sessionKey);
+
+    // 3. HITL timeout check
     if (session && session.status === 'human_handling') {
       const hitlTimeout = parseInt(process.env.HITL_TIMEOUT_MINUTES || '30', 10);
-      // SQLite CURRENT_TIMESTAMP is in UTC format 'YYYY-MM-DD HH:MM:SS'
-      // By appending 'Z', JS Date correctly parses it as UTC time
-      const updatedAtStr = session.updated_at.replace(' ', 'T') + 'Z';
-      const updatedAt = new Date(updatedAtStr);
-      const now = new Date();
-      const diffMinutes = (now - updatedAt) / (1000 * 60);
+      const updatedAt = new Date(session.updated_at.replace(' ', 'T') + 'Z');
+      const diffMinutes = (Date.now() - updatedAt.getTime()) / (1000 * 60);
 
       if (diffMinutes > hitlTimeout) {
-        console.log(`Human handling timeout (${hitlTimeout}m) reached for ${customerId}. Reverting to bot_active.`);
-        updateStatus(customerId, 'bot_active');
+        console.log(`[FB] HITL timeout reached for ${customerId}. Reverting to bot_active.`);
+        updateStatus(sessionKey, 'bot_active');
         session.status = 'bot_active';
       } else {
-        console.log(`Message from ${customerId} ignored because human_handling is active. (${Math.round(hitlTimeout - diffMinutes)}m remaining)`);
-        continue; // Return without AI generation
+        console.log(`[FB] ${customerId} is in human_handling — message skipped.`);
+        continue;
       }
     }
 
-    // 2. We proceed to AI Generation if status is 'bot_active' or new user
     const chatHistory = session ? session.chat_history : [];
 
+    // 4. Log inbound
+    await logUsage(tenantId, 'INBOUND', incomingText, customerId);
+
     try {
-      // 3. Get Configuration
-      // Check if we have a hardcoded token in the Environment Variables
-      let facebookAccessToken = process.env[`PAGE_TOKEN_${pageId}`];
-      let facebookPrompt = process.env[`PAGE_PROMPT_${pageId}`] || "You are a helpful customer service representative. Be polite, concise, and helpful.";
+      // 5. Generate AI response
+      const aiReplyText = await generateAIResponse(activePrompt, chatHistory, incomingText, aiModel);
 
-      // If we don't have a token, or want dynamic prompt, we fetch from Mosaaedak API fallback
-      try {
-        const config = await fetchBotConfig(pageId);
-        if (config.facebookAccessToken && !facebookAccessToken) {
-          facebookAccessToken = config.facebookAccessToken;
-        }
-        if (config.facebookPrompt) {
-          facebookPrompt = config.facebookPrompt;
-        }
-      } catch (err) {
-        console.log("Could not fetch Mosaaedak API config, falling back to local defaults if available.");
-      }
-
-      if (!facebookAccessToken) {
-        throw new Error(`No access token available for page ID ${pageId}`);
-      }
-
-      // 4. Generate AI Response
-      const aiReplyText = await generateAIResponse(facebookPrompt, chatHistory, incomingText);
-
-      // 5. Update Chat History
-      // Keep only recent 10 messages (5 hits, 5 replies) or similar to save context limit if needed
-      // but for now append everything:
+      // 6. Save chat history
       const newHistory = [
         ...chatHistory,
         { role: 'user', content: incomingText },
-        { role: 'assistant', content: aiReplyText }
+        { role: 'assistant', content: aiReplyText },
       ];
-      saveChatHistory(customerId, newHistory, 'bot_active');
+      saveChatHistory(sessionKey, newHistory, 'bot_active');
 
-      // 6. Send Response to FB
+      // 7. Send reply
       await sendFacebookMessage(pageId, customerId, aiReplyText, facebookAccessToken);
 
-    } catch (error) {
-      console.error(`Error processing message for ${customerId}:`, error.message);
+      // 8. Log outbound
+      await logUsage(tenantId, 'OUTBOUND', aiReplyText, customerId);
+
+    } catch (err) {
+      console.error(`[FB] Error processing message for ${customerId}:`, err.message);
     }
   }
 }
 
-module.exports = {
-  processWebhookEvent
-};
+module.exports = { processWebhookEvent };

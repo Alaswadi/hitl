@@ -2,116 +2,160 @@ const axios = require('axios');
 const { getSession, updateStatus, saveChatHistory } = require('./db');
 const { generateAIResponse } = require('./ai');
 
-const TEXTMEBOT_API_KEY = process.env.TEXTMEBOT_API_KEY;
+const MOSAAEDAK_API_URL = process.env.MOSAAEDAK_API_URL;
+const MOSAAEDAK_API_KEY = process.env.MOSAAEDAK_API_KEY;
+const COST_PER_MESSAGE = parseFloat(process.env.COST_PER_MESSAGE || '0.03');
 
 /**
- * Send a message to WhatsApp via TextMeBot
- * @param {string} recipient - The recipient's phone number
- * @param {string} text - The AI generated text
+ * Fetch WhatsApp tenant config from Mosaaedak by bot phone number.
+ * Returns { tenantId, prompt, aiModel, textmebotApiKey }
  */
-async function sendWhatsappMessage(recipient, text) {
+async function fetchWhatsappConfig(botPhone) {
+  const url = `${MOSAAEDAK_API_URL}/api/integrations/whatsapp/config/${encodeURIComponent(botPhone)}`;
+  const response = await axios.get(url, {
+    headers: { 'X-API-Key': MOSAAEDAK_API_KEY },
+    timeout: 5000,
+  });
+  return response.data;
+}
+
+/**
+ * Send a message to WhatsApp via TextMeBot using the tenant's own API key.
+ */
+async function sendWhatsappMessage(recipient, text, textmebotApiKey) {
+  const url = `https://api.textmebot.com/send.php?recipient=${encodeURIComponent(recipient)}&apikey=${encodeURIComponent(textmebotApiKey)}&text=${encodeURIComponent(text)}`;
+  await axios.get(url, { timeout: 10000 });
+}
+
+/**
+ * Log message usage back to Mosaaedak for billing.
+ */
+async function logUsage(tenantId, direction, content, fromPhone) {
   try {
-    // TextMeBot supports GET requests for sending simple text messages
-    const url = `https://api.textmebot.com/send.php?recipient=${recipient}&apikey=${TEXTMEBOT_API_KEY}&text=${encodeURIComponent(text)}`;
-    await axios.get(url);
-    console.log(`Successfully sent WhatsApp message to ${recipient}`);
-  } catch (error) {
-    console.error('Error sending WhatsApp message:', error.message);
+    await axios.post(
+      `${MOSAAEDAK_API_URL}/api/integrations/n8n/usage`,
+      {
+        tenantId,
+        direction,
+        content,
+        channel: 'WHATSAPP',
+        from: fromPhone,
+        cost: direction === 'OUTBOUND' ? COST_PER_MESSAGE : 0,
+        deduct: direction === 'OUTBOUND',
+      },
+      {
+        headers: { 'X-API-Key': MOSAAEDAK_API_KEY },
+        timeout: 5000,
+      }
+    );
+  } catch (err) {
+    // Non-fatal — log but don't crash message flow
+    console.error('Failed to log usage:', err.message);
   }
 }
 
 /**
- * Handle incoming TextMeBot webhooks
+ * Handle incoming TextMeBot webhooks.
+ * Payload: { type, from, from_name, to, file, message }
  */
 async function processWhatsappWebhook(body) {
-  // textmebot webhook format: { type, from, from_name, to, file, message }
-  if (!body.message) return;
-  
-  const senderId = body.from;
-  const recipientId = body.to;
-  const incomingText = body.message;
-  
-  const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
-  // If WHATSAPP_PHONE_NUMBER is defined, use it. Otherwise, assume 'to' is the bot's number
-  const botNumber = WHATSAPP_PHONE_NUMBER || recipientId; 
-  
-  // If the message is sent BY the bot's number, it implies human admin takeover
-  const isSentByBot = (senderId === botNumber);
+  // Basic input validation
+  if (!body || typeof body.message !== 'string' || !body.message.trim()) return;
+  if (!body.from || !body.to) return;
 
-  if (isSentByBot) {
-    // If the human admin replied, the 'to' field would be the customer's number
-    const customerId = recipientId;
-    console.log(`Human admin replied to ${customerId} via WhatsApp. Pausing bot.`);
-    updateStatus(customerId, 'human_handling');
+  const senderId = String(body.from).trim();
+  const botNumber = String(body.to).trim();
+  const incomingText = body.message.trim();
+
+  // If the message is sent FROM the bot number it's an admin reply — pause the bot
+  if (senderId === botNumber) {
+    // 'to' is the customer's number
+    const customerId = String(body.to).trim(); // this case shouldn't fire, but guard anyway
+    console.log(`[WA] Admin message detected — ignoring self-echo for ${customerId}`);
     return;
   }
 
-  // Otherwise, it's a message from a normal customer to the bot
-  const customerId = senderId;
-  
-  // 1. Check DB State
-  let session = getSession(customerId);
+  // 1. Fetch tenant config by bot number
+  let config;
+  try {
+    config = await fetchWhatsappConfig(botNumber);
+  } catch (err) {
+    console.error(`[WA] Cannot find tenant for bot number ${botNumber}:`, err.message);
+    return;
+  }
+
+  const { tenantId, prompt, aiModel, textmebotApiKey } = config;
+
+  if (!textmebotApiKey) {
+    console.error(`[WA] No TextMeBot API key configured for tenant ${tenantId}`);
+    return;
+  }
+
+  // 2. Session key is scoped to tenant + customer
+  const sessionKey = `wa:${tenantId}:${senderId}`;
+
+  // 3. Check HITL state
+  let session = getSession(sessionKey);
+
   if (session && session.status === 'human_handling') {
     const hitlTimeout = parseInt(process.env.HITL_TIMEOUT_MINUTES || '30', 10);
-    const updatedAtStr = session.updated_at.replace(' ', 'T') + 'Z';
-    const updatedAt = new Date(updatedAtStr);
-    const now = new Date();
-    const diffMinutes = (now - updatedAt) / (1000 * 60);
+    const updatedAt = new Date(session.updated_at.replace(' ', 'T') + 'Z');
+    const diffMinutes = (Date.now() - updatedAt.getTime()) / (1000 * 60);
 
     if (diffMinutes > hitlTimeout) {
-      console.log(`Human handling timeout (${hitlTimeout}m) reached for ${customerId}. Reverting to bot_active.`);
-      updateStatus(customerId, 'bot_active');
+      console.log(`[WA] HITL timeout reached for ${senderId}. Reverting to bot_active.`);
+      updateStatus(sessionKey, 'bot_active');
       session.status = 'bot_active';
     } else {
-      console.log(`WhatsApp message from ${customerId} ignored because human_handling is active. (${Math.round(hitlTimeout - diffMinutes)}m remaining)`);
+      console.log(`[WA] ${senderId} is in human_handling — message skipped.`);
       return;
     }
   }
 
-  // Keyword check for Human Takeover (Option 1)
-  const humanKeywords = ["موظف", "بشري", "خدمة العملاء", "مساعدة", "التحدث مع شخص", "اكلم حد"];
-  const wantsHuman = humanKeywords.some(kw => incomingText.includes(kw));
-
-  if (wantsHuman) {
-    console.log(`Customer ${customerId} requested human via keyword. Pausing bot.`);
-    updateStatus(customerId, 'human_handling');
-    await sendWhatsappMessage(customerId, "تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.");
+  // 4. Human takeover keyword check
+  const humanKeywords = ['موظف', 'بشري', 'خدمة العملاء', 'مساعدة', 'التحدث مع شخص', 'اكلم حد'];
+  if (humanKeywords.some((kw) => incomingText.includes(kw))) {
+    console.log(`[WA] ${senderId} requested human agent via keyword.`);
+    updateStatus(sessionKey, 'human_handling');
+    await sendWhatsappMessage(senderId, 'تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.', textmebotApiKey);
     return;
   }
 
   const chatHistory = session ? session.chat_history : [];
 
+  // 5. Log inbound message
+  await logUsage(tenantId, 'INBOUND', incomingText, senderId);
+
   try {
-    const whatsappPrompt = process.env.WHATSAPP_PROMPT || "أنت ممثل خدمة عملاء محترف عبر الواتساب. كن مهذباً ومختصراً. إذا طلب العميل صراحةً التحدث إلى موظف بشري أو كان غاضباً، يجب عليك أن تكتب [PAUSE_BOT] في ردك ليتم تحويله.";
+    // 6. Generate AI response
+    let aiReplyText = await generateAIResponse(prompt, chatHistory, incomingText, aiModel);
 
-    // 2. Generate AI Response
-    let aiReplyText = await generateAIResponse(whatsappPrompt, chatHistory, incomingText);
-
-    // AI-driven Takeover check (Option 2)
-    if (aiReplyText.includes("[PAUSE_BOT]")) {
-      console.log(`AI opted to pause bot for ${customerId}.`);
-      updateStatus(customerId, 'human_handling');
-      
-      // Clean up the text sent to the user
+    // 7. AI-driven HITL check
+    if (aiReplyText.includes('[PAUSE_BOT]')) {
+      console.log(`[WA] AI requested HITL pause for ${senderId}.`);
+      updateStatus(sessionKey, 'human_handling');
       aiReplyText = aiReplyText.replace(/\[PAUSE_BOT\]/gi, '').trim();
       if (!aiReplyText) {
-        aiReplyText = "تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.";
+        aiReplyText = 'تم تحويلك إلى خدمة العملاء. سيقوم أحد موظفينا بالرد عليك قريباً.';
       }
     }
 
-    // 3. Update Chat History
+    // 8. Save chat history
     const newHistory = [
       ...chatHistory,
       { role: 'user', content: incomingText },
-      { role: 'assistant', content: aiReplyText }
+      { role: 'assistant', content: aiReplyText },
     ];
-    saveChatHistory(customerId, newHistory, 'bot_active');
+    saveChatHistory(sessionKey, newHistory, 'bot_active');
 
-    // 4. Send Response via TextMeBot
-    await sendWhatsappMessage(customerId, aiReplyText);
-    
-  } catch (error) {
-    console.error(`Error processing WhatsApp message for ${customerId}:`, error.message);
+    // 9. Send reply
+    await sendWhatsappMessage(senderId, aiReplyText, textmebotApiKey);
+
+    // 10. Log outbound message
+    await logUsage(tenantId, 'OUTBOUND', aiReplyText, senderId);
+
+  } catch (err) {
+    console.error(`[WA] Error processing message for ${senderId}:`, err.message);
   }
 }
 
